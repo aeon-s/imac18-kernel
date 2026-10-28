@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# build-imac-kernel.sh
+# Builds a Linux kernel tuned for the 2017 27" iMac (iMac18,3):
+#   Intel Kaby Lake CPU, AMD Radeon Pro 570/575/580 (Polaris), Broadcom Wi-Fi,
+#   Apple SMC sensors/fans, Thunderbolt 3, 5K internal display.
+#
+# What makes it "tuned":
+#   - Compiled for your exact CPU (-march=native via CONFIG_X86_NATIVE_CPU)
+#   - Only the drivers your machine actually uses (localmodconfig) -> smaller, faster boot
+#   - Desktop-latency settings: full preemption, 1000 Hz timer
+#   - Multi-gen LRU (better behavior under memory pressure), BBR networking, zram
+#   - Debug info stripped -> much faster build, smaller install
+#
+# Run this ON the iMac, booted into Linux, with your usual USB devices plugged in
+# (localmodconfig only keeps drivers for hardware it currently sees loaded; the
+# list in kernel-extras.inc.sh adds back on-demand features like VM networking).
+# Keep kernel-extras.inc.sh in the same folder as this script.
+#
+# Usage:  ./build-imac-kernel.sh [kernel-version]
+#   e.g.  ./build-imac-kernel.sh            # latest stable from kernel.org
+#         ./build-imac-kernel.sh 6.17.5     # a specific version
+#
+# Your existing kernel is NOT removed. If the new one misbehaves, pick the old one
+# from the GRUB menu (hold Shift or press Esc at boot to show it).
+
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+[[ -f "$HERE/kernel-extras.inc.sh" ]] || { echo "ERROR: kernel-extras.inc.sh must be next to this script." >&2; exit 1; }
+# shellcheck source=kernel-extras.inc.sh
+source "$HERE/kernel-extras.inc.sh"
+
+LOCALVERSION="-imac18"
+WORKDIR="${HOME}/imac-kernel"
+JOBS="$(nproc)"
+
+say()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+# Never stop silently: report the line and exit code of any failing command
+trap 'rc=$?; printf "\n\033[1;31mERROR: script stopped at line %s (exit code %s).\033[0m\n" "$LINENO" "$rc" >&2' ERR
+
+# ---------------------------------------------------------------- sanity checks
+[[ "$(uname -m)" == "x86_64" ]] || die "This script is for the Intel iMac (x86_64)."
+[[ $EUID -ne 0 ]] || die "Run as your normal user; the script calls sudo when it needs to."
+
+MODEL="$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
+if [[ "$MODEL" != "iMac18,3" ]]; then
+  echo "Detected model: $MODEL (expected iMac18,3)."
+  read -rp "Continue anyway? [y/N] " a; [[ "$a" =~ ^[Yy]$ ]] || exit 1
+fi
+
+# ---------------------------------------------------------------- sudo up front
+# Ask for the password once now, then keep sudo alive in the background so the
+# install step after the long build doesn't stall waiting for a password.
+say "Your password is needed once now (for installing packages and the kernel)"
+sudo -v
+( while true; do sudo -n true; sleep 60; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+SUDO_KEEPALIVE_PID=$!
+trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+
+# ---------------------------------------------------------------- dependencies
+say "Installing build dependencies"
+if command -v apt-get >/dev/null; then
+  DISTRO=debian
+  sudo apt-get update
+  sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev \
+    libncurses-dev dwarves zstd curl jq rsync cpio kmod
+elif command -v dnf >/dev/null; then
+  DISTRO=fedora
+  sudo dnf install -y gcc make bc bison flex openssl-devel elfutils-libelf-devel \
+    ncurses-devel dwarves zstd curl jq rsync cpio kmod perl diffutils
+  # Fedora 41+ moved the OpenSSL ENGINE headers the kernel's sign-file tool uses
+  sudo dnf install -y openssl-devel-engine 2>/dev/null || true
+elif command -v pacman >/dev/null; then
+  DISTRO=arch
+  sudo pacman -S --needed --noconfirm base-devel bc libelf pahole zstd curl jq \
+    rsync cpio kmod
+else
+  die "Unsupported distro (need apt, dnf or pacman)."
+fi
+
+# ---------------------------------------------------------------- pick version
+VER="${1:-}"
+if [[ -z "$VER" ]]; then
+  say "Looking up latest stable kernel on kernel.org"
+  VER="$(curl -fsSL https://www.kernel.org/releases.json | jq -r '.latest_stable.version')"
+fi
+[[ "$VER" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "Bad kernel version: '$VER'"
+MAJOR="${VER%%.*}"
+say "Kernel version: $VER"
+
+# ---------------------------------------------------------------- download
+mkdir -p "$WORKDIR"; cd "$WORKDIR"
+TARBALL="linux-${VER}.tar.xz"
+if [[ ! -f "$TARBALL" ]]; then
+  say "Downloading $TARBALL"
+  curl -fL -o "$TARBALL" "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/${TARBALL}"
+fi
+rm -rf "linux-${VER}"
+tar -xf "$TARBALL"
+cd "linux-${VER}"
+
+# ---------------------------------------------------------------- base config
+say "Starting from your current kernel's config"
+if [[ -f "/boot/config-$(uname -r)" ]]; then
+  cp "/boot/config-$(uname -r)" .config
+elif [[ -r /proc/config.gz ]]; then
+  zcat /proc/config.gz > .config
+else
+  die "Can't find your running kernel's config."
+fi
+make olddefconfig
+
+say "Trimming to drivers this iMac actually uses (localmodconfig)"
+# (yes ... || true): when make finishes, `yes` is killed by SIGPIPE; without
+# this, pipefail + set -e would silently abort the whole script here.
+(yes "" || true) | make localmodconfig >/dev/null
+
+# ---------------------------------------------------------------- iMac tuning
+say "Applying iMac18,3 tuning"
+C=scripts/config
+
+$C --set-str LOCALVERSION "$LOCALVERSION"
+
+# CPU: compile for exactly this Kaby Lake (option exists in Linux 6.16+)
+$C --enable X86_NATIVE_CPU
+
+# Desktop latency
+$C --enable PREEMPT --disable PREEMPT_VOLUNTARY --disable PREEMPT_NONE
+$C --enable HZ_1000 --disable HZ_250 --disable HZ_300 --disable HZ_100 --set-val HZ 1000
+
+# Memory: multi-gen LRU on by default, zram with zstd for swap-in-RAM
+$C --enable LRU_GEN --enable LRU_GEN_ENABLED
+$C --module ZRAM --enable ZSTD_COMPRESS
+
+# Networking: BBR congestion control as default
+$C --enable TCP_CONG_BBR --enable DEFAULT_BBR --set-str DEFAULT_TCP_CONG bbr
+
+# Make sure the iMac's own hardware is always included, even if something
+# wasn't loaded when localmodconfig ran
+$C --module DRM_AMDGPU                       # Radeon Pro 570/575/580
+$C --module SENSORS_APPLESMC                 # fans, temps, ambient light
+$C --module HID_APPLE                        # Apple keyboards
+$C --module HID_MAGICMOUSE                   # Magic Mouse / Trackpad
+$C --module BRCMFMAC                         # Broadcom Wi-Fi
+$C --module BT_HCIBTUSB --module BT_BCM      # Broadcom Bluetooth
+$C --module SND_HDA_INTEL --module SND_HDA_CODEC_CIRRUS --module SND_HDA_CODEC_CS8409
+$C --module THUNDERBOLT                      # Thunderbolt 3 ports
+$C --module USB_XHCI_PCI
+$C --module NVME_CORE --module BLK_DEV_NVME  # harmless if you have SATA/Fusion
+$C --module DM_MOD                           # LVM / encrypted disks
+$C --enable INTEL_IDLE --enable X86_INTEL_PSTATE --module INTEL_POWERCLAMP
+
+# On-demand desktop features that localmodconfig can't see (firewall NAT for
+# VMs, KVM, containers, USB-drive filesystems, common USB devices)
+apply_desktop_extras
+
+# Faster build, smaller kernel: no debug info
+$C --disable DEBUG_INFO --enable DEBUG_INFO_NONE \
+   --disable DEBUG_INFO_DWARF4 --disable DEBUG_INFO_DWARF5 \
+   --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT --disable DEBUG_INFO_BTF
+
+# Ubuntu/Debian configs point at signing keys you don't have
+if [[ "$DISTRO" == debian ]]; then
+  $C --set-str SYSTEM_TRUSTED_KEYS "" --set-str SYSTEM_REVOCATION_KEYS ""
+fi
+
+make olddefconfig
+
+# Confirm the CPU option stuck (older kernels don't have it)
+if ! grep -q '^CONFIG_X86_NATIVE_CPU=y' .config; then
+  echo "Note: CONFIG_X86_NATIVE_CPU unavailable in $VER; adding -march=native manually."
+  export KCFLAGS="-march=native -O2"
+fi
+
+# ---------------------------------------------------------------- build
+say "Building with $JOBS jobs (expect roughly 15-40 minutes on this iMac)"
+make -j"$JOBS"
+
+# ---------------------------------------------------------------- install
+say "Installing modules and kernel"
+sudo make modules_install
+KREL="$(make -s kernelrelease)"
+
+case "$DISTRO" in
+  debian)
+    sudo make install            # installkernel -> update-initramfs + update-grub
+    ;;
+  fedora)
+    sudo make install            # kernel-install -> dracut + BLS entry
+    ;;
+  arch)
+    sudo install -Dm644 arch/x86/boot/bzImage "/boot/vmlinuz-linux-imac18"
+    sudo mkinitcpio -k "$KREL" -g "/boot/initramfs-linux-imac18.img"
+    if command -v grub-mkconfig >/dev/null; then
+      sudo grub-mkconfig -o /boot/grub/grub.cfg
+    else
+      echo "Add a boot entry for /boot/vmlinuz-linux-imac18 in your bootloader."
+    fi
+    ;;
+esac
+
+say "Done. Installed kernel $KREL"
+cat <<EOF
+
+Reboot and pick "$KREL" in the GRUB menu (it's usually the default).
+After booting, check:
+  uname -r                      # should end in $LOCALVERSION
+  sensors                       # applesmc fan/temp readings (install lm-sensors)
+  glxinfo -B | grep renderer    # should show AMD Radeon Pro (install mesa-utils)
+
+If anything is wrong, reboot and choose your previous kernel under
+"Advanced options" in GRUB. Nothing was removed.
+EOF
